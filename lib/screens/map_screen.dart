@@ -1,8 +1,12 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 import 'package:geolocator/geolocator.dart';
 import '../services/location_service.dart';
 import '../services/routing_service.dart';
+import '../models/graphhopper_response.dart';
+import '../widgets/navigation_instructions_panel.dart';
+import '../widgets/current_instruction_banner.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -24,15 +28,45 @@ class _MapScreenState extends State<MapScreen> {
   bool _isLoadingRoute = false;
   bool _isRerouting = false;
   bool _isLoading = true;
-  bool _is3DMode = true;
+  bool _is3DMode = false; // Podrazumevano 2D
   bool _isAutoFollowing = true;
+  int _currentMapStyleIndex = 0;
 
   Line? _routeLine;
   Symbol? _destinationSymbol;
+  Path? _currentRoutePath;
+  int _currentInstructionIndex =
+      1; // Počinjemo od 1 (preskačemo prvu instrukciju)
+  double _instructionThresholdDistance =
+      80.0; // Metara pre instrukcije za prikaz
 
   static const double _navigationZoomLevel = 17.0;
   static const double _tiltAngle = 60.0;
   static const double _rerouteDistanceThreshold = 30.0;
+
+  // Dostupni stilovi mapa - optimizovani za taksiste
+  final List<Map<String, String>> _mapStyles = [
+    {
+      'name': '🗺️ OSM Bright',
+      'url': 'https://tiles.openfreemap.org/styles/bright',
+      'description': 'Svetla mapa sa jasnim putevima',
+    },
+    {
+      'name': '🌆 OSM Liberty',
+      'url': 'https://tiles.openfreemap.org/styles/liberty',
+      'description': 'Balanced stil sa dobrim kontrastom',
+    },
+    {
+      'name': '🛣️ Positron',
+      'url': 'https://tiles.openfreemap.org/styles/positron',
+      'description': 'Minimalistički - fokus na puteve',
+    },
+    {
+      'name': '🌙 Dark Matter',
+      'url': 'https://tiles.openfreemap.org/styles/dark-matter',
+      'description': 'Tamna mapa - noćna vožnja',
+    },
+  ];
 
   @override
   void initState() {
@@ -75,6 +109,7 @@ class _MapScreenState extends State<MapScreen> {
       }
 
       _checkIfNeedsRerouting();
+      _checkInstructionProgress();
     });
   }
 
@@ -88,6 +123,12 @@ class _MapScreenState extends State<MapScreen> {
   Future<void> _centerMapOnUser() async {
     if (_mapController == null || _currentPosition == null) return;
 
+    // Ako imamo rutu, rotiramo kameru u pravcu sledeće tačke instrukcije
+    double cameraBearing = 0.0;
+    if (_routePoints.isNotEmpty && _currentRoutePath != null) {
+      cameraBearing = _calculateBearingToNextInstruction();
+    }
+
     await _mapController!.animateCamera(
       CameraUpdate.newCameraPosition(
         CameraPosition(
@@ -96,12 +137,52 @@ class _MapScreenState extends State<MapScreen> {
             _currentPosition!.longitude,
           ),
           zoom: _navigationZoomLevel,
-          bearing: _currentHeading,
+          bearing: cameraBearing, // Rotacija ka sledećoj instrukciji
           tilt: _is3DMode ? _tiltAngle : 0.0,
         ),
       ),
     );
   }
+
+  /// Izračunava bearing (ugao) od trenutne pozicije ka sledećoj tački instrukcije
+  double _calculateBearingToNextInstruction() {
+    if (_currentPosition == null || _routePoints.isEmpty) return 0.0;
+    if (_currentRoutePath == null) return 0.0;
+
+    final instructions = _currentRoutePath!.instructions;
+    if (_currentInstructionIndex >= instructions.length) return 0.0;
+
+    final currentInstruction = instructions[_currentInstructionIndex];
+    final instructionPointIndex = currentInstruction.interval.first;
+
+    if (instructionPointIndex >= _routePoints.length) return 0.0;
+
+    final targetPoint = _routePoints[instructionPointIndex];
+
+    // Izračunavamo bearing od trenutne pozicije ka tački instrukcije
+    return _calculateBearing(
+      _currentPosition!.latitude,
+      _currentPosition!.longitude,
+      targetPoint.latitude,
+      targetPoint.longitude,
+    );
+  }
+
+  /// Izračunava bearing (ugao) između dve tačke
+  double _calculateBearing(double lat1, double lon1, double lat2, double lon2) {
+    final dLon = _toRadians(lon2 - lon1);
+    final lat1Rad = _toRadians(lat1);
+    final lat2Rad = _toRadians(lat2);
+
+    final y = sin(dLon) * cos(lat2Rad);
+    final x =
+        cos(lat1Rad) * sin(lat2Rad) - sin(lat1Rad) * cos(lat2Rad) * cos(dLon);
+
+    final bearing = atan2(y, x);
+    return (bearing * 180 / pi + 360) % 360; // Konvertuje u stepene (0-360)
+  }
+
+  double _toRadians(double degrees) => degrees * pi / 180.0;
 
   void _toggle3DMode() {
     setState(() => _is3DMode = !_is3DMode);
@@ -109,14 +190,78 @@ class _MapScreenState extends State<MapScreen> {
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(_is3DMode ? '🎮 3D Navigacija' : '📱 2D Mapa'),
+        content: Text(_is3DMode ? '🎮 3D Pogled' : '📱 2D Mapa'),
         duration: const Duration(seconds: 1),
         backgroundColor: _is3DMode ? Colors.blue : Colors.grey,
       ),
     );
   }
 
-  Future<void> _testRouteTrnska() async {
+  Future<void> _changeMapStyle() async {
+    final selectedIndex = await showDialog<int>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Izaberi stil mape'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(_mapStyles.length, (index) {
+            final style = _mapStyles[index];
+            final isSelected = index == _currentMapStyleIndex;
+            return ListTile(
+              selected: isSelected,
+              selectedTileColor: Colors.blue[50],
+              leading: Text(
+                style['name']!.split(' ')[0],
+                style: const TextStyle(fontSize: 24),
+              ),
+              title: Text(
+                style['name']!.substring(style['name']!.indexOf(' ') + 1),
+                style: TextStyle(
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                ),
+              ),
+              subtitle: Text(
+                style['description']!,
+                style: const TextStyle(fontSize: 12),
+              ),
+              trailing: isSelected
+                  ? const Icon(Icons.check, color: Colors.blue)
+                  : null,
+              onTap: () => Navigator.pop(context, index),
+            );
+          }),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Otkaži'),
+          ),
+        ],
+      ),
+    );
+
+    if (selectedIndex != null && selectedIndex != _currentMapStyleIndex) {
+      setState(() => _currentMapStyleIndex = selectedIndex);
+
+      // Promena stila mape
+      if (_mapController != null) {
+        await _mapController!.setStyle(_mapStyles[selectedIndex]['url']!);
+
+        // Sačekaj malo da se stil učita, pa ponovo nacrtaj rutu
+        await Future.delayed(const Duration(milliseconds: 500));
+        if (_routePoints.isNotEmpty) {
+          await _drawRoute();
+          if (_destination != null) {
+            await _addDestinationMarker();
+          }
+        }
+      }
+
+      _showSuccess('Stil promenjen: ${_mapStyles[selectedIndex]['name']}');
+    }
+  }
+
+  Future<void> _createRouteToDestination(LatLng destination) async {
     if (_currentPosition == null) {
       _showError('GPS pozicija nije dostupna');
       return;
@@ -124,34 +269,47 @@ class _MapScreenState extends State<MapScreen> {
 
     setState(() => _isLoadingRoute = true);
 
-    const destLat = 44.80239533259546;
-    const destLon = 20.476799408890763;
-
     try {
-      final routePoints = await _routingService.getRoute(
+      final response = await _routingService.getRoute(
         fromLat: _currentPosition!.latitude,
         fromLon: _currentPosition!.longitude,
-        toLat: destLat,
-        toLon: destLon,
+        toLat: destination.latitude,
+        toLon: destination.longitude,
+        profile: 'car',
       );
 
-      if (routePoints != null && routePoints.isNotEmpty) {
-        setState(() {
-          _routePoints = routePoints;
-          _destination = LatLng(destLat, destLon);
-          _isLoadingRoute = false;
-        });
+      if (response != null && response.paths.isNotEmpty) {
+        final routePoints = _routingService.getRoutePoints(response);
 
-        await _drawRoute();
-        await _addDestinationMarker();
-        await _fitRouteBounds();
+        if (routePoints.isNotEmpty) {
+          setState(() {
+            _currentRoutePath = response.paths.first;
+            _routePoints = routePoints;
+            _destination = destination;
+            _isLoadingRoute = false;
+            _currentInstructionIndex =
+                1; // Počinjemo od druge instrukcije (index 1)
+          });
 
-        Future.delayed(const Duration(seconds: 2), () {
-          _centerMapOnUser();
-          setState(() => _isAutoFollowing = true);
-        });
+          await _drawRoute();
+          await _addDestinationMarker();
+          await _fitRouteBounds();
 
-        _showSuccess('Ruta pronađena: ${routePoints.length} tačaka');
+          Future.delayed(const Duration(seconds: 2), () {
+            _centerMapOnUser();
+            setState(() => _isAutoFollowing = true);
+          });
+
+          _showSuccess(
+            'Ruta: ${_currentRoutePath!.getDistanceText()} • ${_currentRoutePath!.getTimeText()}',
+          );
+
+          // Prikaži prvu aktivnu instrukciju
+          _showCurrentInstruction();
+        } else {
+          setState(() => _isLoadingRoute = false);
+          _showError('Ruta nije pronađena');
+        }
       } else {
         setState(() => _isLoadingRoute = false);
         _showError('Ruta nije pronađena');
@@ -238,10 +396,107 @@ class _MapScreenState extends State<MapScreen> {
       _destination = null;
       _routeLine = null;
       _destinationSymbol = null;
+      _currentRoutePath = null;
+      _currentInstructionIndex = 1;
     });
 
     _centerMapOnUser();
     _showSuccess('Ruta obrisana');
+  }
+
+  /// Proverava napredak prema sledećoj instrukciji
+  void _checkInstructionProgress() {
+    if (_currentRoutePath == null || _currentPosition == null) return;
+    if (_routePoints.isEmpty) return;
+
+    final instructions = _currentRoutePath!.instructions;
+
+    // Preskačemo ako smo prošli sve instrukcije
+    if (_currentInstructionIndex >= instructions.length) return;
+
+    final currentInstruction = instructions[_currentInstructionIndex];
+
+    // Dobijamo tačku na ruti gde se nalazi trenutna instrukcija
+    final instructionPointIndex = currentInstruction.interval.first;
+
+    if (instructionPointIndex < _routePoints.length) {
+      final instructionPoint = _routePoints[instructionPointIndex];
+
+      final distanceToInstruction = _routingService.calculateDistance(
+        _currentPosition!.latitude,
+        _currentPosition!.longitude,
+        instructionPoint.latitude,
+        instructionPoint.longitude,
+      );
+
+      // Ako smo prošli instrukciju (manje od 20m), prelazimo na sledeću
+      if (distanceToInstruction < 20.0) {
+        setState(() {
+          _currentInstructionIndex++;
+        });
+
+        // Prikaži sledeću instrukciju
+        if (_currentInstructionIndex < instructions.length) {
+          _showCurrentInstruction();
+        } else {
+          _showSuccess('🏁 Stigli ste na destinaciju!');
+        }
+      }
+      // Ako se približavamo (unutar threshold-a), prikaži upozorenje
+      else if (distanceToInstruction < _instructionThresholdDistance &&
+          distanceToInstruction > 20.0) {
+        // Ovde možeš dodati audio ili vizuelno upozorenje
+        print('⚠️ Približavate se skretanju: ${currentInstruction.text}');
+      }
+    }
+  }
+
+  /// Prikazuje trenutnu aktivnu instrukciju
+  void _showCurrentInstruction() {
+    if (_currentRoutePath == null) return;
+
+    final instructions = _currentRoutePath!.instructions;
+    if (_currentInstructionIndex >= instructions.length) return;
+
+    final instruction = instructions[_currentInstructionIndex];
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Text(
+              instruction.getInstructionIcon(),
+              style: const TextStyle(fontSize: 24),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    instruction.text,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 15,
+                    ),
+                  ),
+                  if (instruction.distance > 0)
+                    Text(
+                      'Za ${instruction.getDistanceText()}',
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        duration: const Duration(seconds: 4),
+        backgroundColor: Colors.blue[800],
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
   }
 
   void _checkIfNeedsRerouting() {
@@ -288,28 +543,41 @@ class _MapScreenState extends State<MapScreen> {
     setState(() => _isRerouting = true);
 
     try {
-      final routePoints = await _routingService.getRoute(
+      final response = await _routingService.getRoute(
         fromLat: _currentPosition!.latitude,
         fromLon: _currentPosition!.longitude,
         toLat: _destination!.latitude,
         toLon: _destination!.longitude,
+        profile: 'car',
       );
 
-      if (routePoints != null && routePoints.isNotEmpty) {
-        setState(() {
-          _routePoints = routePoints;
-          _isRerouting = false;
-        });
+      if (response != null && response.paths.isNotEmpty) {
+        final routePoints = _routingService.getRoutePoints(response);
 
-        await _drawRoute();
+        if (routePoints.isNotEmpty) {
+          setState(() {
+            _currentRoutePath = response.paths.first;
+            _routePoints = routePoints;
+            _isRerouting = false;
+            _currentInstructionIndex =
+                1; // Reset na drugu instrukciju posle reroutinga
+          });
 
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('🔄 Ruta ažurirana'),
-            duration: Duration(seconds: 1),
-            backgroundColor: Colors.orange,
-          ),
-        );
+          await _drawRoute();
+
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('🔄 Ruta ažurirana'),
+              duration: Duration(seconds: 1),
+              backgroundColor: Colors.orange,
+            ),
+          );
+
+          // Prikaži novu trenutnu instrukciju
+          _showCurrentInstruction();
+        } else {
+          setState(() => _isRerouting = false);
+        }
       } else {
         setState(() => _isRerouting = false);
       }
@@ -341,10 +609,6 @@ class _MapScreenState extends State<MapScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('🚕 Mega Taxi Terminal'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-      ),
       body: _isLoading
           ? const Center(
               child: Column(
@@ -358,8 +622,9 @@ class _MapScreenState extends State<MapScreen> {
             )
           : Stack(
               children: [
+                // Mapa
                 MaplibreMap(
-                  styleString: 'https://tiles.openfreemap.org/styles/liberty',
+                  styleString: _mapStyles[_currentMapStyleIndex]['url']!,
                   initialCameraPosition: CameraPosition(
                     target: _currentPosition != null
                         ? LatLng(
@@ -371,9 +636,36 @@ class _MapScreenState extends State<MapScreen> {
                     tilt: _is3DMode ? _tiltAngle : 0.0,
                   ),
                   onMapCreated: _onMapCreated,
-                  onMapClick: (point, latLng) {
-                    if (_isAutoFollowing) {
-                      setState(() => _isAutoFollowing = false);
+                  onMapClick: (point, latLng) async {
+                    // Ako već postoji ruta, pitaj korisnika da li želi novu
+                    if (_routePoints.isNotEmpty) {
+                      final shouldCreate = await showDialog<bool>(
+                        context: context,
+                        builder: (context) => AlertDialog(
+                          title: const Text('Nova ruta?'),
+                          content: const Text(
+                            'Da li želite da kreirate novu rutu do ove lokacije?',
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.pop(context, false),
+                              child: const Text('Otkaži'),
+                            ),
+                            ElevatedButton(
+                              onPressed: () => Navigator.pop(context, true),
+                              child: const Text('Kreiraj'),
+                            ),
+                          ],
+                        ),
+                      );
+
+                      if (shouldCreate == true) {
+                        await _clearRoute();
+                        await _createRouteToDestination(latLng);
+                      }
+                    } else {
+                      // Ako nema rute, odmah kreiraj
+                      _createRouteToDestination(latLng);
                     }
                   },
                   myLocationEnabled: true,
@@ -384,8 +676,30 @@ class _MapScreenState extends State<MapScreen> {
                   compassEnabled: true,
                   minMaxZoomPreference: const MinMaxZoomPreference(5.0, 20.0),
                 ),
+
+                // Veliki banner sa trenutnom instrukcijom (na vrhu)
+                if (_currentRoutePath != null &&
+                    _currentInstructionIndex <
+                        _currentRoutePath!.instructions.length)
+                  Positioned(
+                    top: 16,
+                    left: 16,
+                    right: 16,
+                    child: CurrentInstructionBanner(
+                      instruction: _currentRoutePath!
+                          .instructions[_currentInstructionIndex],
+                      nextInstruction:
+                          _currentInstructionIndex + 1 <
+                              _currentRoutePath!.instructions.length
+                          ? _currentRoutePath!
+                                .instructions[_currentInstructionIndex + 1]
+                          : null,
+                    ),
+                  ),
+
+                // Panel sa informacijama o poziciji
                 Positioned(
-                  top: 16,
+                  top: _currentRoutePath != null ? 160 : 16,
                   right: 16,
                   child: Container(
                     padding: const EdgeInsets.all(12),
@@ -429,19 +743,25 @@ class _MapScreenState extends State<MapScreen> {
                     ),
                   ),
                 ),
+
+                // Navigation Instructions Panel (na dnu ekrana)
+                if (_currentRoutePath != null)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: NavigationInstructionsPanel(
+                      routePath: _currentRoutePath!,
+                      currentInstructionIndex: _currentInstructionIndex,
+                      onClose: _clearRoute,
+                    ),
+                  ),
               ],
             ),
       floatingActionButton: Column(
         mainAxisAlignment: MainAxisAlignment.end,
         children: [
-          if (!_isLoadingRoute && _routePoints.isEmpty)
-            FloatingActionButton.extended(
-              heroTag: 'test_route',
-              onPressed: _testRouteTrnska,
-              backgroundColor: Colors.green,
-              icon: const Icon(Icons.route),
-              label: const Text('Test Ruta'),
-            ),
+          // Dugme za brisanje rute
           if (_routePoints.isNotEmpty)
             FloatingActionButton.extended(
               heroTag: 'clear_route',
@@ -450,12 +770,28 @@ class _MapScreenState extends State<MapScreen> {
               icon: const Icon(Icons.clear),
               label: const Text('Obriši'),
             ),
+
+          // Loading indicator
           if (_isLoadingRoute)
             const Padding(
               padding: EdgeInsets.only(bottom: 12),
               child: CircularProgressIndicator(),
             ),
+
           const SizedBox(height: 12),
+
+          // Promena stila mape
+          FloatingActionButton(
+            heroTag: 'map_style',
+            mini: true,
+            onPressed: _changeMapStyle,
+            backgroundColor: Colors.green[600],
+            child: const Icon(Icons.layers, color: Colors.white),
+          ),
+
+          const SizedBox(height: 12),
+
+          // 3D toggle
           FloatingActionButton(
             heroTag: '3d_toggle',
             mini: true,
@@ -466,7 +802,10 @@ class _MapScreenState extends State<MapScreen> {
               color: _is3DMode ? Colors.white : Colors.black87,
             ),
           ),
+
           const SizedBox(height: 12),
+
+          // Center on user location
           FloatingActionButton(
             heroTag: 'recenter',
             onPressed: () {
