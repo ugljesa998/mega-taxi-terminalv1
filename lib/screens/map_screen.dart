@@ -80,20 +80,41 @@ class _MapScreenState extends State<MapScreen> {
 
       // SPEEDOMETAR - Smooth brzina (kao Mapbox)
       double speedKmh = position.speed * 3.6; // m/s → km/h
-      // Ako je ispod 2 km/h, prikaži 0 (GPS šum kad stojimo)
-      speedKmh = speedKmh < 2.0 ? 0.0 : speedKmh;
+
+      // GPS ŠUM FILTER - agresivniji filter za stojeće stanje
+      // GPS u zgradi može pokazati 5-10 km/h dok stojimo!
+      if (speedKmh < 2.0) {
+        speedKmh = 0.0; // Ispod 5 km/h = stojiš
+      }
+
       // Exponential moving average za smooth prikaz
-      _smoothSpeed = (_smoothSpeed * 0.7) + (speedKmh * 0.3);
+      _smoothSpeed = (_smoothSpeed * 0.8) + (speedKmh * 0.2);
 
-      // SNAP-TO-ROAD - "lepi" poziciju za rutu!
+      // SNAP-TO-ROAD - "lepi" poziciju za rutu! (ako Mapbox)
       if (_routePoints.isNotEmpty) {
+        final rawGPS = LatLng(position.latitude, position.longitude);
         _snappedPosition = _snapToRoute(position);
-        // Ako nema snapped pozicije (van rute), koristi sirovi GPS
-        _snappedPosition ??= LatLng(position.latitude, position.longitude);
 
-        // BEARING CALCULATION - samo kad se kreće (speed > 1.5 m/s)
-        // Sprečava "trzanje" kad stojimo
-        if (position.speed > 1.5 && _snappedPosition != null) {
+        // Pin je UVEK na ruti dok je navigacija aktivna - vozači ne voze po trotoaru!
+        _snappedPosition ??= rawGPS;
+
+        // DEBUG: Udaljenost između raw GPS i snapped pozicije
+        final snapDistance = _routingService.calculateDistance(
+          rawGPS.latitude,
+          rawGPS.longitude,
+          _snappedPosition!.latitude,
+          _snappedPosition!.longitude,
+        );
+        print(
+          '🛣️ Snap: ${snapDistance.toStringAsFixed(1)}m razlike | '
+          'Ruta tačaka: ${_routePoints.length}',
+        );
+
+        // BEARING CALCULATION - samo kad se ZAISTA kreće (speed > 5 km/h = 1.4 m/s)
+        // GPS u zgradi može pokazati lažnu brzinu!
+        if (position.speed > 1.4 &&
+            speedKmh > 5.0 &&
+            _snappedPosition != null) {
           _calculateBearingFromRoute(_snappedPosition!);
           _currentHeading = _currentBearing;
         } else if (position.heading >= 0) {
@@ -325,7 +346,7 @@ class _MapScreenState extends State<MapScreen> {
     return minDistance;
   }
 
-  /// SNAP-TO-ROAD - "Lepi" GPS poziciju za rutu (sprečava lutanje po zgradama)
+  /// SNAP-TO-ROAD - "Lepi" GPS poziciju za rutu (kao Mapbox - pin UVEK na putu!)
   LatLng? _snapToRoute(Position position) {
     if (_routePoints.isEmpty) return null;
 
@@ -349,10 +370,15 @@ class _MapScreenState extends State<MapScreen> {
       }
     }
 
-    // 2. Ako je GPS u prihvatljivom rangu (50m), snap na rutu
-    const double offRouteThreshold = 50.0; // metara
-    if (minDistance <= offRouteThreshold && closestPoint != null) {
-      // 3. INTERPOLACIJA - projekcija GPS-a na liniju između 2 tačke
+    if (closestPoint == null) return null;
+
+    // 2. Ako je blizu (50m), koristi INTERPOLACIJU za smooth prikaz
+    const double interpolationThreshold = 50.0; // metara
+    if (minDistance <= interpolationThreshold) {
+      // DEBUG
+      print('✅ SNAP: ${minDistance.toStringAsFixed(1)}m - INTERPOLACIJA');
+
+      // INTERPOLACIJA - projekcija GPS-a na liniju između 2 tačke
       if (closestIndex < _routePoints.length - 1) {
         final nextPoint = _routePoints[closestIndex + 1];
         return _projectPointOnLine(
@@ -362,10 +388,14 @@ class _MapScreenState extends State<MapScreen> {
         );
       }
       return closestPoint;
+    } else {
+      // 3. Ako je daleko (50m+), snap na najbližu tačku BEZ interpolacije
+      // PIN OSTAJE NA RUTI - vozači ne voze po trotoaru! (kao Mapbox)
+      print(
+        '⚠️ SNAP: ${minDistance.toStringAsFixed(1)}m - DALEKO, snap na najbližu',
+      );
+      return closestPoint;
     }
-
-    // Ako je van rute, vrati null (trigger re-routing)
-    return null;
   }
 
   /// Projekcija tačke na liniju (perpendikular)
