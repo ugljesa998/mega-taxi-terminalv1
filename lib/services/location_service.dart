@@ -58,9 +58,10 @@ class LocationService {
 
     print('📡 Pokrećem praćenje pozicije...');
 
+    // NAVIGACIJA - najbolja konfiguracija za smooth tracking
     const locationSettings = LocationSettings(
-      accuracy: LocationAccuracy.high,
-      distanceFilter: 1, // 1 metar - smooth tracking
+      accuracy: LocationAccuracy.bestForNavigation, // Najbolja preciznost
+      distanceFilter: 1, // Update na svakom metru - smooth kao Mapbox
     );
 
     _positionSubscription =

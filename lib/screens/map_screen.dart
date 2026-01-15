@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 import 'package:geolocator/geolocator.dart';
@@ -17,7 +18,10 @@ class _MapScreenState extends State<MapScreen> {
 
   MaplibreMapController? _mapController;
   Position? _currentPosition;
+  LatLng? _snappedPosition; // Snapped pozicija za smooth prikaz
   double _currentHeading = 0.0;
+  double _currentBearing = 0.0; // Bearing izračunat iz rute
+  double _smoothSpeed = 0.0; // Smooth brzina (km/h)
 
   List<LatLng> _routePoints = [];
   LatLng? _destination;
@@ -65,17 +69,52 @@ class _MapScreenState extends State<MapScreen> {
   void _startLocationTracking() {
     _locationService.startTracking();
     _locationService.positionStream.listen((Position position) {
-      setState(() {
-        _currentPosition = position;
-        _currentHeading = position.heading;
-      });
-
-      if (_isAutoFollowing && _mapController != null) {
-        _centerMapOnUser();
-      }
-
-      _checkIfNeedsRerouting();
+      _updateCarPosition(position);
     });
+  }
+
+  /// SMOOTH TRACKING - ažurira poziciju i prati SNAPPED poziciju
+  void _updateCarPosition(Position position) {
+    setState(() {
+      _currentPosition = position;
+
+      // SPEEDOMETAR - Smooth brzina (kao Mapbox)
+      double speedKmh = position.speed * 3.6; // m/s → km/h
+      // Ako je ispod 2 km/h, prikaži 0 (GPS šum kad stojimo)
+      speedKmh = speedKmh < 2.0 ? 0.0 : speedKmh;
+      // Exponential moving average za smooth prikaz
+      _smoothSpeed = (_smoothSpeed * 0.7) + (speedKmh * 0.3);
+
+      // SNAP-TO-ROAD - "lepi" poziciju za rutu!
+      if (_routePoints.isNotEmpty) {
+        _snappedPosition = _snapToRoute(position);
+        // Ako nema snapped pozicije (van rute), koristi sirovi GPS
+        _snappedPosition ??= LatLng(position.latitude, position.longitude);
+
+        // BEARING CALCULATION - samo kad se kreće (speed > 1.5 m/s)
+        // Sprečava "trzanje" kad stojimo
+        if (position.speed > 1.5 && _snappedPosition != null) {
+          _calculateBearingFromRoute(_snappedPosition!);
+          _currentHeading = _currentBearing;
+        } else if (position.heading >= 0) {
+          // Kad stojimo ili spora brzina, koristi GPS heading
+          _currentHeading = position.heading;
+        }
+      } else {
+        _snappedPosition = LatLng(position.latitude, position.longitude);
+        // Bez rute, koristi GPS heading
+        if (position.heading >= 0) {
+          _currentHeading = position.heading;
+        }
+      }
+    });
+
+    // SMOOTH praćenje - koristi SNAPPED poziciju (ne sirovi GPS!)
+    if (_isAutoFollowing && _mapController != null) {
+      _centerMapOnUser();
+    }
+
+    _checkIfNeedsRerouting();
   }
 
   void _onMapCreated(MaplibreMapController controller) {
@@ -88,13 +127,15 @@ class _MapScreenState extends State<MapScreen> {
   Future<void> _centerMapOnUser() async {
     if (_mapController == null || _currentPosition == null) return;
 
+    // Koristi SNAPPED poziciju za smooth praćenje (bez lutanja po zgradama)
+    final targetPosition =
+        _snappedPosition ??
+        LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
+
     await _mapController!.animateCamera(
       CameraUpdate.newCameraPosition(
         CameraPosition(
-          target: LatLng(
-            _currentPosition!.latitude,
-            _currentPosition!.longitude,
-          ),
+          target: targetPosition,
           zoom: _navigationZoomLevel,
           bearing: _currentHeading,
           tilt: _is3DMode ? _tiltAngle : 0.0,
@@ -169,12 +210,14 @@ class _MapScreenState extends State<MapScreen> {
       await _mapController!.removeLine(_routeLine!);
     }
 
+    // Iscrtavanje rute sa podacima koji se dobijaju sa API-ja
+    // Podaci su u formatu List<LatLng> koje dobijamo od routing servisa
     _routeLine = await _mapController!.addLine(
       LineOptions(
         geometry: _routePoints,
-        lineColor: '#4A90E2',
-        lineWidth: 6.0,
-        lineOpacity: 0.9,
+        lineColor: '#2196F3', // Plava boja - jasna i vidljiva
+        lineWidth: 8.0, // Debljina 8 piksela - dovoljno jasna na ulici
+        lineOpacity: 0.95, // Visoka opacity za bolju vidljivost
       ),
     );
   }
@@ -282,6 +325,102 @@ class _MapScreenState extends State<MapScreen> {
     return minDistance;
   }
 
+  /// SNAP-TO-ROAD - "Lepi" GPS poziciju za rutu (sprečava lutanje po zgradama)
+  LatLng? _snapToRoute(Position position) {
+    if (_routePoints.isEmpty) return null;
+
+    double minDistance = double.infinity;
+    LatLng? closestPoint;
+    int closestIndex = -1;
+
+    // 1. Pronađi najbližu tačku na ruti
+    for (int i = 0; i < _routePoints.length; i++) {
+      final distance = _routingService.calculateDistance(
+        position.latitude,
+        position.longitude,
+        _routePoints[i].latitude,
+        _routePoints[i].longitude,
+      );
+
+      if (distance < minDistance) {
+        minDistance = distance;
+        closestPoint = _routePoints[i];
+        closestIndex = i;
+      }
+    }
+
+    // 2. Ako je GPS u prihvatljivom rangu (50m), snap na rutu
+    const double offRouteThreshold = 50.0; // metara
+    if (minDistance <= offRouteThreshold && closestPoint != null) {
+      // 3. INTERPOLACIJA - projekcija GPS-a na liniju između 2 tačke
+      if (closestIndex < _routePoints.length - 1) {
+        final nextPoint = _routePoints[closestIndex + 1];
+        return _projectPointOnLine(
+          LatLng(position.latitude, position.longitude),
+          closestPoint,
+          nextPoint,
+        );
+      }
+      return closestPoint;
+    }
+
+    // Ako je van rute, vrati null (trigger re-routing)
+    return null;
+  }
+
+  /// Projekcija tačke na liniju (perpendikular)
+  LatLng _projectPointOnLine(LatLng point, LatLng lineStart, LatLng lineEnd) {
+    final dx = lineEnd.longitude - lineStart.longitude;
+    final dy = lineEnd.latitude - lineStart.latitude;
+
+    if (dx == 0 && dy == 0) return lineStart;
+
+    // Parametar t (0-1) određuje poziciju na liniji
+    final t =
+        ((point.longitude - lineStart.longitude) * dx +
+            (point.latitude - lineStart.latitude) * dy) /
+        (dx * dx + dy * dy);
+
+    final clampedT = t.clamp(0.0, 1.0); // Odrezi van linije
+
+    return LatLng(
+      lineStart.latitude + clampedT * dy,
+      lineStart.longitude + clampedT * dx,
+    );
+  }
+
+  /// ROTACIJA PIN-A - Izračunava bearing prema sledećoj tački na ruti
+  void _calculateBearingFromRoute(LatLng currentPos) {
+    if (_routePoints.length < 2) return;
+
+    // 1. Pronađi najbližu tačku na ruti
+    int closestIndex = 0;
+    double minDist = double.infinity;
+
+    for (int i = 0; i < _routePoints.length; i++) {
+      final dist = _routingService.calculateDistance(
+        currentPos.latitude,
+        currentPos.longitude,
+        _routePoints[i].latitude,
+        _routePoints[i].longitude,
+      );
+      if (dist < minDist) {
+        minDist = dist;
+        closestIndex = i;
+      }
+    }
+
+    // 2. Uzmi SLEDEĆU tačku za bearing (ne prethodnu!)
+    if (closestIndex < _routePoints.length - 1) {
+      final nextPoint = _routePoints[closestIndex + 1];
+      final dy = nextPoint.latitude - currentPos.latitude;
+      final dx = nextPoint.longitude - currentPos.longitude;
+
+      // 3. atan2 za bearing (u stepenima)
+      _currentBearing = atan2(dx, dy) * 180 / pi;
+    }
+  }
+
   Future<void> _performRerouting() async {
     if (_destination == null || _currentPosition == null) return;
 
@@ -329,6 +468,13 @@ class _MapScreenState extends State<MapScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('✅ $message'), backgroundColor: Colors.green),
     );
+  }
+
+  /// Boja brzine po opsegu (kao Mapbox)
+  Color _getSpeedColor() {
+    if (_smoothSpeed < 5) return Colors.grey; // Peške/stojimo
+    if (_smoothSpeed < 30) return Colors.orange; // Gužva
+    return Colors.green; // Normalna vožnja
   }
 
   @override
@@ -415,6 +561,14 @@ class _MapScreenState extends State<MapScreen> {
                         Text(
                           '🧭 ${_currentHeading.toStringAsFixed(1)}°',
                           style: const TextStyle(fontSize: 12),
+                        ),
+                        Text(
+                          '🏃 ${_smoothSpeed.toStringAsFixed(0)} km/h',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                            color: _getSpeedColor(),
+                          ),
                         ),
                         if (_isRerouting)
                           const Text(
