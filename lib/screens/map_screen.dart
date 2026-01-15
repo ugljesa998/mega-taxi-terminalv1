@@ -31,6 +31,8 @@ class _MapScreenState extends State<MapScreen> {
   bool _isLoading = true;
   bool _is3DMode = true;
   bool _isAutoFollowing = true;
+  bool _isNorthUpMode =
+      true; // North Up (stabilna mapa) ili Heading Up (rotira se)
 
   // Stilovi mape
   int _currentMapStyle = 0;
@@ -44,6 +46,7 @@ class _MapScreenState extends State<MapScreen> {
 
   Line? _routeLine;
   Symbol? _destinationSymbol;
+  Circle? _userPositionCircle; // Custom pin (krug) na snapped poziciji
 
   static const double _navigationZoomLevel = 17.0;
   static const double _tiltAngle = 60.0;
@@ -148,6 +151,9 @@ class _MapScreenState extends State<MapScreen> {
       _centerMapOnUser();
     }
 
+    // Ažuriraj custom user marker (pin na snapped poziciji - UVEK na putu!)
+    _updateUserPositionMarker();
+
     _checkIfNeedsRerouting();
   }
 
@@ -155,6 +161,8 @@ class _MapScreenState extends State<MapScreen> {
     _mapController = controller;
     if (_currentPosition != null) {
       _centerMapOnUser();
+      // Prikaži user marker odmah
+      _updateUserPositionMarker();
     }
   }
 
@@ -166,12 +174,24 @@ class _MapScreenState extends State<MapScreen> {
         _snappedPosition ??
         LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
 
+    // STABILNA KAMERA - bearing kontrola
+    // North Up (default) = bearing 0 (stabilna mapa, sever gore)
+    // Heading Up = prati heading (rotira se, ali samo kad se kreće)
+    double cameraBearing = 0.0;
+    if (!_isNorthUpMode) {
+      // Heading Up mode - koristi bearing samo kad se kreće (> 5 km/h)
+      final speedKmh = (_currentPosition?.speed ?? 0) * 3.6;
+      if (speedKmh > 5.0) {
+        cameraBearing = _currentHeading;
+      }
+    }
+
     await _mapController!.animateCamera(
       CameraUpdate.newCameraPosition(
         CameraPosition(
           target: targetPosition,
           zoom: _navigationZoomLevel,
-          bearing: _currentHeading,
+          bearing: cameraBearing,
           tilt: _is3DMode ? _tiltAngle : 0.0,
         ),
       ),
@@ -187,6 +207,21 @@ class _MapScreenState extends State<MapScreen> {
         content: Text(_is3DMode ? '🎮 3D Navigacija' : '📱 2D Mapa'),
         duration: const Duration(seconds: 1),
         backgroundColor: _is3DMode ? Colors.blue : Colors.grey,
+      ),
+    );
+  }
+
+  void _toggleNorthUp() {
+    setState(() => _isNorthUpMode = !_isNorthUpMode);
+    _centerMapOnUser();
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          _isNorthUpMode ? '🧭 North Up (Stabilna)' : '🎯 Heading Up',
+        ),
+        duration: const Duration(seconds: 1),
+        backgroundColor: _isNorthUpMode ? Colors.green : Colors.orange,
       ),
     );
   }
@@ -307,6 +342,40 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  /// Ažurira custom user position marker (na snapped poziciji kad ima rutu - UVEK na putu!)
+  Future<void> _updateUserPositionMarker() async {
+    if (_mapController == null) return;
+
+    // Ako ima rutu, koristi SNAPPED poziciju (na putu!)
+    // Ako nema rutu, koristi raw GPS
+    LatLng? markerPosition = _snappedPosition;
+    if (_routePoints.isEmpty && _currentPosition != null) {
+      markerPosition = LatLng(
+        _currentPosition!.latitude,
+        _currentPosition!.longitude,
+      );
+    }
+
+    if (markerPosition == null) return;
+
+    // Ukloni stari marker (Circle)
+    if (_userPositionCircle != null) {
+      await _mapController!.removeCircle(_userPositionCircle!);
+    }
+
+    // Dodaj novi circle marker (plavi krug sa belim outline-om)
+    _userPositionCircle = await _mapController!.addCircle(
+      CircleOptions(
+        geometry: markerPosition,
+        circleRadius: 10.0, // Radius u metrima
+        circleColor: '#2196F3', // Plava boja
+        circleStrokeColor: '#FFFFFF', // Beli outline
+        circleStrokeWidth: 3.0,
+        circleOpacity: 0.9,
+      ),
+    );
+  }
+
   Future<void> _fitRouteBounds() async {
     if (_mapController == null || _routePoints.isEmpty) return;
 
@@ -343,6 +412,7 @@ class _MapScreenState extends State<MapScreen> {
     if (_destinationSymbol != null && _mapController != null) {
       await _mapController!.removeSymbol(_destinationSymbol!);
     }
+    // NE brišemo user position marker - ostaje da prikazuje poziciju
 
     setState(() {
       _routePoints = [];
@@ -603,11 +673,8 @@ class _MapScreenState extends State<MapScreen> {
                       setState(() => _isAutoFollowing = false);
                     }
                   },
-                  myLocationEnabled: true,
-                  myLocationTrackingMode: _isAutoFollowing
-                      ? MyLocationTrackingMode.tracking
-                      : MyLocationTrackingMode.none,
-                  myLocationRenderMode: MyLocationRenderMode.normal,
+                  myLocationEnabled:
+                      false, // Isključi native GPS marker (koristimo custom)
                   compassEnabled: true,
                   minMaxZoomPreference: const MinMaxZoomPreference(5.0, 20.0),
                 ),
@@ -708,6 +775,17 @@ class _MapScreenState extends State<MapScreen> {
             child: Icon(
               _is3DMode ? Icons.view_in_ar : Icons.map,
               color: _is3DMode ? Colors.white : Colors.black87,
+            ),
+          ),
+          const SizedBox(height: 12),
+          FloatingActionButton(
+            heroTag: 'north_up_toggle',
+            mini: true,
+            onPressed: _toggleNorthUp,
+            backgroundColor: _isNorthUpMode ? Colors.green : Colors.orange,
+            child: Icon(
+              _isNorthUpMode ? Icons.explore : Icons.navigation,
+              color: Colors.white,
             ),
           ),
           const SizedBox(height: 12),
