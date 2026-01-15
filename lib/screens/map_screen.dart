@@ -1,5 +1,6 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 import 'package:geolocator/geolocator.dart';
 import '../services/location_service.dart';
@@ -31,6 +32,16 @@ class _MapScreenState extends State<MapScreen> {
   bool _is3DMode = true;
   bool _isAutoFollowing = true;
 
+  // Stilovi mape
+  int _currentMapStyle = 0;
+  final List<MapStyle> _mapStyles = [
+    MapStyle(
+      name: 'Liberty',
+      url: 'https://tiles.openfreemap.org/styles/liberty',
+    ),
+    MapStyle(name: 'OSM', url: 'https://tiles.openfreemap.org/styles/positron'),
+  ];
+
   Line? _routeLine;
   Symbol? _destinationSymbol;
 
@@ -41,6 +52,8 @@ class _MapScreenState extends State<MapScreen> {
   @override
   void initState() {
     super.initState();
+    // FULL SCREEN - Skloni status bar (baterija, vreme, itd.)
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     _initializeMap();
   }
 
@@ -174,6 +187,40 @@ class _MapScreenState extends State<MapScreen> {
         content: Text(_is3DMode ? '🎮 3D Navigacija' : '📱 2D Mapa'),
         duration: const Duration(seconds: 1),
         backgroundColor: _is3DMode ? Colors.blue : Colors.grey,
+      ),
+    );
+  }
+
+  void _toggleMapStyle() async {
+    // Sačuvaj trenutno stanje
+    final hadRoute = _routePoints.isNotEmpty;
+    final savedRoutePoints = List<LatLng>.from(_routePoints);
+    final savedDestination = _destination;
+
+    setState(() {
+      _currentMapStyle = (_currentMapStyle + 1) % _mapStyles.length;
+      // Očisti controller da forsira rebuild mape
+      _mapController = null;
+    });
+
+    // Ponovo nacrtaj rutu nakon rebuild-a mape
+    if (hadRoute) {
+      await Future.delayed(const Duration(milliseconds: 1000));
+      setState(() {
+        _routePoints = savedRoutePoints;
+        _destination = savedDestination;
+      });
+      await _drawRoute();
+      if (_destination != null) {
+        await _addDestinationMarker();
+      }
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('🗺️ ${_mapStyles[_currentMapStyle].name} Mapa'),
+        duration: const Duration(seconds: 1),
+        backgroundColor: Colors.blue,
       ),
     );
   }
@@ -509,6 +556,11 @@ class _MapScreenState extends State<MapScreen> {
 
   @override
   void dispose() {
+    // Vrati sistem UI nazad kad izađeš iz navigacije
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.edgeToEdge,
+      overlays: SystemUiOverlay.values,
+    );
     _locationService.dispose();
     _mapController?.dispose();
     super.dispose();
@@ -517,10 +569,6 @@ class _MapScreenState extends State<MapScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('🚕 Mega Taxi Terminal'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-      ),
       body: _isLoading
           ? const Center(
               child: Column(
@@ -535,7 +583,10 @@ class _MapScreenState extends State<MapScreen> {
           : Stack(
               children: [
                 MaplibreMap(
-                  styleString: 'https://tiles.openfreemap.org/styles/liberty',
+                  key: ValueKey(
+                    _currentMapStyle,
+                  ), // Force rebuild na promenu stila
+                  styleString: _mapStyles[_currentMapStyle].url,
                   initialCameraPosition: CameraPosition(
                     target: _currentPosition != null
                         ? LatLng(
@@ -618,6 +669,15 @@ class _MapScreenState extends State<MapScreen> {
       floatingActionButton: Column(
         mainAxisAlignment: MainAxisAlignment.end,
         children: [
+          // Dugme za promenu stila mape
+          FloatingActionButton.extended(
+            heroTag: 'map_style',
+            onPressed: _toggleMapStyle,
+            backgroundColor: Colors.purple,
+            icon: const Icon(Icons.layers),
+            label: Text(_mapStyles[_currentMapStyle].name),
+          ),
+          const SizedBox(height: 12),
           if (!_isLoadingRoute && _routePoints.isEmpty)
             FloatingActionButton.extended(
               heroTag: 'test_route',
@@ -667,4 +727,12 @@ class _MapScreenState extends State<MapScreen> {
       ),
     );
   }
+}
+
+/// Model za stil mape
+class MapStyle {
+  final String name;
+  final String url;
+
+  MapStyle({required this.name, required this.url});
 }
