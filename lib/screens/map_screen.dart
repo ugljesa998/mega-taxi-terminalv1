@@ -21,6 +21,7 @@ class _MapScreenState extends State<MapScreen> {
 
   MaplibreMapController? _mapController;
   Position? _currentPosition;
+  LatLng? _snappedPosition; // 📍 SNAP-TO-ROAD: Pozicija "zakačena" na rutu
   double _currentHeading = 0.0;
 
   List<LatLng> _routePoints = [];
@@ -34,6 +35,9 @@ class _MapScreenState extends State<MapScreen> {
 
   Line? _routeLine;
   Symbol? _destinationSymbol;
+  Circle?
+  _userLocationCircle; // 📍 SNAP-TO-ROAD: Custom location marker (kao LocationComponent)
+  Circle? _userLocationPulse; // 📍 Pulsing circle oko markera za vidljivost
   Path? _currentRoutePath;
   int _currentInstructionIndex =
       1; // Počinjemo od 1 (preskačemo prvu instrukciju)
@@ -102,7 +106,19 @@ class _MapScreenState extends State<MapScreen> {
       setState(() {
         _currentPosition = position;
         _currentHeading = position.heading;
+
+        // 📍 SNAP-TO-ROAD: Ako imamo rutu, "zakači" poziciju na rutu
+        if (_routePoints.isNotEmpty) {
+          _snappedPosition = _snapToRoute(
+            LatLng(position.latitude, position.longitude),
+          );
+        } else {
+          _snappedPosition = null;
+        }
       });
+
+      // 📍 SNAP-TO-ROAD: Ažuriraj marker poziciju (kao forceLocationUpdate)
+      _updateUserLocationMarker();
 
       if (_isAutoFollowing && _mapController != null) {
         _centerMapOnUser();
@@ -113,15 +129,74 @@ class _MapScreenState extends State<MapScreen> {
     });
   }
 
-  void _onMapCreated(MaplibreMapController controller) {
+  void _onMapCreated(MaplibreMapController controller) async {
     _mapController = controller;
+
+    // 📍 SNAP-TO-ROAD: Kreiraj custom location marker nakon što se mapa učita
     if (_currentPosition != null) {
-      _centerMapOnUser();
+      // Mali delay da se mapa sigurno učita
+      await Future.delayed(const Duration(milliseconds: 500));
+      await _updateUserLocationMarker();
+      await _centerMapOnUser();
+    }
+  }
+
+  /// 📍 SNAP-TO-ROAD: Ažurira custom location marker (kao locationComponent.forceLocationUpdate)
+  /// Identično Android LocationComponent sa RenderMode.GPS
+  Future<void> _updateUserLocationMarker() async {
+    if (_mapController == null || _currentPosition == null) return;
+
+    // Koristi snapped poziciju ako postoji, inače raw GPS
+    final markerPosition =
+        _snappedPosition ??
+        LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
+
+    try {
+      // Obriši stare markere
+      if (_userLocationCircle != null) {
+        await _mapController!.removeCircle(_userLocationCircle!);
+      }
+      if (_userLocationPulse != null) {
+        await _mapController!.removeCircle(_userLocationPulse!);
+      }
+
+      // 1. Svetlo plavi/sivi accuracy circle (kao u Android verziji)
+      _userLocationPulse = await _mapController!.addCircle(
+        CircleOptions(
+          geometry: markerPosition,
+          circleRadius: 15.0, // Accuracy radius
+          circleColor: '#78909C', // Siva boja
+          circleOpacity: 0.15,
+          circleStrokeWidth: 1.5,
+          circleStrokeColor: '#78909C',
+          circleStrokeOpacity: 0.4,
+        ),
+      );
+
+      // 2. MALI SIVI PIN u centru (kao GPS tačkica u Android LocationComponent)
+      _userLocationCircle = await _mapController!.addCircle(
+        CircleOptions(
+          geometry: markerPosition,
+          circleRadius: 5.0, // Mali radius - tačkica
+          circleColor: '#78909C', // Siva boja (kao u Android verziji)
+          circleOpacity: 1.0,
+          circleStrokeWidth: 2.5,
+          circleStrokeColor: '#FFFFFF', // Beli border
+          circleStrokeOpacity: 1.0,
+        ),
+      );
+    } catch (e) {
+      // Ignoriši greške pri ažuriranju markera
     }
   }
 
   Future<void> _centerMapOnUser() async {
     if (_mapController == null || _currentPosition == null) return;
+
+    // 📍 SNAP-TO-ROAD: Koristi snapped poziciju ako postoji, inače raw GPS
+    final targetPosition =
+        _snappedPosition ??
+        LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
 
     // Ako imamo rutu, rotiramo kameru u pravcu sledeće tačke instrukcije
     double cameraBearing = 0.0;
@@ -132,10 +207,7 @@ class _MapScreenState extends State<MapScreen> {
     await _mapController!.animateCamera(
       CameraUpdate.newCameraPosition(
         CameraPosition(
-          target: LatLng(
-            _currentPosition!.latitude,
-            _currentPosition!.longitude,
-          ),
+          target: targetPosition,
           zoom: _navigationZoomLevel,
           bearing: cameraBearing, // Rotacija ka sledećoj instrukciji
           tilt: _is3DMode ? _tiltAngle : 0.0,
@@ -159,10 +231,15 @@ class _MapScreenState extends State<MapScreen> {
 
     final targetPoint = _routePoints[instructionPointIndex];
 
-    // Izračunavamo bearing od trenutne pozicije ka tački instrukcije
+    // 📍 SNAP-TO-ROAD: Koristi snapped poziciju za bearing ako postoji
+    final fromPosition =
+        _snappedPosition ??
+        LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
+
+    // Izračunavamo bearing od trenutne (snapped) pozicije ka tački instrukcije
     return _calculateBearing(
-      _currentPosition!.latitude,
-      _currentPosition!.longitude,
+      fromPosition.latitude,
+      fromPosition.longitude,
       targetPoint.latitude,
       targetPoint.longitude,
     );
@@ -183,6 +260,89 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   double _toRadians(double degrees) => degrees * pi / 180.0;
+
+  /// 📍 SNAP-TO-ROAD: Projektuje GPS poziciju na najbliži segment rute
+  /// Algoritam identičan Android MapLibre Navigation SDK-u
+  LatLng? _snapToRoute(LatLng currentPosition) {
+    if (_routePoints.isEmpty) return null;
+    if (_routePoints.length < 2) return _routePoints.first;
+
+    LatLng? closestPoint;
+    double minDistance = double.infinity;
+
+    // Prolazimo kroz sve segmente rute (svaki par susednih tačaka)
+    for (int i = 0; i < _routePoints.length - 1; i++) {
+      final segmentStart = _routePoints[i];
+      final segmentEnd = _routePoints[i + 1];
+
+      // Projektuj trenutnu poziciju na ovaj segment
+      final projectedPoint = _projectPointOnSegment(
+        currentPosition,
+        segmentStart,
+        segmentEnd,
+      );
+
+      // Izračunaj distancu od trenutne pozicije do projektovane tačke
+      final distance = _routingService.calculateDistance(
+        currentPosition.latitude,
+        currentPosition.longitude,
+        projectedPoint.latitude,
+        projectedPoint.longitude,
+      );
+
+      // Zapamti najbližu tačku
+      if (distance < minDistance) {
+        minDistance = distance;
+        closestPoint = projectedPoint;
+      }
+    }
+
+    return closestPoint;
+  }
+
+  /// 📍 Projektuje tačku na linijski segment (između A i B)
+  /// Vraća najbližu tačku na segmentu do zadate tačke
+  LatLng _projectPointOnSegment(
+    LatLng point,
+    LatLng segmentA,
+    LatLng segmentB,
+  ) {
+    // Konvertujemo geografske koordinate u Cartesian za tačniju projekciju
+    final px = point.longitude;
+    final py = point.latitude;
+    final ax = segmentA.longitude;
+    final ay = segmentA.latitude;
+    final bx = segmentB.longitude;
+    final by = segmentB.latitude;
+
+    // Vektor AB
+    final abx = bx - ax;
+    final aby = by - ay;
+
+    // Vektor AP
+    final apx = px - ax;
+    final apy = py - ay;
+
+    // Projekcija AP na AB: t = (AP · AB) / |AB|²
+    final abLengthSquared = abx * abx + aby * aby;
+
+    if (abLengthSquared == 0) {
+      // Segment je zapravo tačka, vrati A
+      return segmentA;
+    }
+
+    // t predstavlja poziciju na segmentu (0 = A, 1 = B)
+    double t = (apx * abx + apy * aby) / abLengthSquared;
+
+    // Ograničavamo t na segment [0, 1]
+    t = t.clamp(0.0, 1.0);
+
+    // Projektovana tačka: P' = A + t * AB
+    final projectedLng = ax + t * abx;
+    final projectedLat = ay + t * aby;
+
+    return LatLng(projectedLat, projectedLng);
+  }
 
   void _toggle3DMode() {
     setState(() => _is3DMode = !_is3DMode);
@@ -289,11 +449,21 @@ class _MapScreenState extends State<MapScreen> {
             _isLoadingRoute = false;
             _currentInstructionIndex =
                 1; // Počinjemo od druge instrukcije (index 1)
+
+            // 📍 SNAP-TO-ROAD: Odmah snap-uj trenutnu poziciju na novu rutu
+            if (_currentPosition != null) {
+              _snappedPosition = _snapToRoute(
+                LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+              );
+            }
           });
 
           await _drawRoute();
           await _addDestinationMarker();
           await _fitRouteBounds();
+
+          // 📍 SNAP-TO-ROAD: Ažuriraj marker odmah nakon što se kreira ruta
+          await _updateUserLocationMarker();
 
           Future.delayed(const Duration(seconds: 2), () {
             _centerMapOnUser();
@@ -398,8 +568,11 @@ class _MapScreenState extends State<MapScreen> {
       _destinationSymbol = null;
       _currentRoutePath = null;
       _currentInstructionIndex = 1;
+      _snappedPosition = null; // 📍 SNAP-TO-ROAD: Reset snapped pozicije
     });
 
+    // 📍 SNAP-TO-ROAD: Ažuriraj marker na raw GPS poziciju
+    await _updateUserLocationMarker();
     _centerMapOnUser();
     _showSuccess('Ruta obrisana');
   }
@@ -422,9 +595,14 @@ class _MapScreenState extends State<MapScreen> {
     if (instructionPointIndex < _routePoints.length) {
       final instructionPoint = _routePoints[instructionPointIndex];
 
+      // 📍 SNAP-TO-ROAD: Koristi snapped poziciju za tačniju proveru
+      final fromPosition =
+          _snappedPosition ??
+          LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
+
       final distanceToInstruction = _routingService.calculateDistance(
-        _currentPosition!.latitude,
-        _currentPosition!.longitude,
+        fromPosition.latitude,
+        fromPosition.longitude,
         instructionPoint.latitude,
         instructionPoint.longitude,
       );
@@ -442,11 +620,10 @@ class _MapScreenState extends State<MapScreen> {
           _showSuccess('🏁 Stigli ste na destinaciju!');
         }
       }
-      // Ako se približavamo (unutar threshold-a), prikaži upozorenje
+      // Ako se približavamo (unutar threshold-a), možemo dodati audio upozorenje
       else if (distanceToInstruction < _instructionThresholdDistance &&
           distanceToInstruction > 20.0) {
-        // Ovde možeš dodati audio ili vizuelno upozorenje
-        print('⚠️ Približavate se skretanju: ${currentInstruction.text}');
+        // Ovde možemo dodati audio ili vizuelno upozorenje
       }
     }
   }
@@ -561,9 +738,19 @@ class _MapScreenState extends State<MapScreen> {
             _isRerouting = false;
             _currentInstructionIndex =
                 1; // Reset na drugu instrukciju posle reroutinga
+
+            // 📍 SNAP-TO-ROAD: Snap-uj na novu re-route-ovanu rutu
+            if (_currentPosition != null) {
+              _snappedPosition = _snapToRoute(
+                LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+              );
+            }
           });
 
           await _drawRoute();
+
+          // 📍 SNAP-TO-ROAD: Ažuriraj marker na novu re-route-ovanu rutu
+          await _updateUserLocationMarker();
 
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -668,11 +855,8 @@ class _MapScreenState extends State<MapScreen> {
                       _createRouteToDestination(latLng);
                     }
                   },
-                  myLocationEnabled: true,
-                  myLocationTrackingMode: _isAutoFollowing
-                      ? MyLocationTrackingMode.tracking
-                      : MyLocationTrackingMode.none,
-                  myLocationRenderMode: MyLocationRenderMode.normal,
+                  // 📍 SNAP-TO-ROAD: Isključena built-in strelica, koristimo samo custom marker
+                  myLocationEnabled: false,
                   compassEnabled: true,
                   minMaxZoomPreference: const MinMaxZoomPreference(5.0, 20.0),
                 ),
@@ -730,6 +914,16 @@ class _MapScreenState extends State<MapScreen> {
                           '🧭 ${_currentHeading.toStringAsFixed(1)}°',
                           style: const TextStyle(fontSize: 12),
                         ),
+                        // 📍 SNAP-TO-ROAD indikator
+                        if (_snappedPosition != null)
+                          const Text(
+                            '📌 Snap: ON',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.green,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
                         if (_isRerouting)
                           const Text(
                             '🔄 Re-routing...',
