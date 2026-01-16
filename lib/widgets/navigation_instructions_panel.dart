@@ -56,21 +56,21 @@ class _NavigationInstructionsPanelState
         setState(() => _isExpanded = !_isExpanded);
       },
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
           color: Colors.blue[700],
           borderRadius: _isExpanded
-              ? const BorderRadius.vertical(top: Radius.circular(16))
-              : const BorderRadius.vertical(top: Radius.circular(16)),
+              ? const BorderRadius.vertical(top: Radius.circular(12))
+              : const BorderRadius.vertical(top: Radius.circular(12)),
         ),
         child: Row(
           children: [
             Icon(
               _isExpanded ? Icons.expand_more : Icons.expand_less,
               color: Colors.white,
-              size: 20,
+              size: 18,
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 6),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -79,7 +79,7 @@ class _NavigationInstructionsPanelState
                     '📍 ${widget.routePath.getDistanceText()} • ⏱️ ${widget.routePath.getTimeText()}',
                     style: const TextStyle(
                       color: Colors.white,
-                      fontSize: 13,
+                      fontSize: 11,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
@@ -88,15 +88,15 @@ class _NavigationInstructionsPanelState
                       children: [
                         Text(
                           currentInstruction.getInstructionIcon(),
-                          style: const TextStyle(fontSize: 16),
+                          style: const TextStyle(fontSize: 14),
                         ),
-                        const SizedBox(width: 6),
+                        const SizedBox(width: 4),
                         Expanded(
                           child: Text(
                             currentInstruction.text,
                             style: const TextStyle(
                               color: Colors.white,
-                              fontSize: 12,
+                              fontSize: 10,
                               fontWeight: FontWeight.w500,
                             ),
                             maxLines: 1,
@@ -110,7 +110,9 @@ class _NavigationInstructionsPanelState
             ),
             if (widget.onClose != null)
               IconButton(
-                icon: const Icon(Icons.close, color: Colors.white),
+                icon: const Icon(Icons.close, color: Colors.white, size: 18),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
                 onPressed: widget.onClose,
               ),
           ],
@@ -122,8 +124,7 @@ class _NavigationInstructionsPanelState
   Widget _buildInstructionsList() {
     return Container(
       constraints: BoxConstraints(
-        maxHeight:
-            MediaQuery.of(context).size.height * 0.15, // Smanjeno sa 0.18
+        maxHeight: MediaQuery.of(context).size.height * 0.12, // Još kompaktnije
       ),
       child: ListView.builder(
         shrinkWrap: true,
@@ -148,7 +149,7 @@ class _NavigationInstructionsPanelState
               });
             },
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
                 color: isCurrentInstruction
                     ? Colors.orange[100]
@@ -166,8 +167,8 @@ class _NavigationInstructionsPanelState
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Container(
-                    width: 30,
-                    height: 30,
+                    width: 24,
+                    height: 24,
                     decoration: BoxDecoration(
                       color: isLastInstruction
                           ? Colors.green[100]
@@ -185,13 +186,13 @@ class _NavigationInstructionsPanelState
                       child: Text(
                         instruction.getInstructionIcon(),
                         style: TextStyle(
-                          fontSize: 16,
+                          fontSize: 13,
                           color: isPassed ? Colors.grey[600] : null,
                         ),
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 6),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -202,7 +203,7 @@ class _NavigationInstructionsPanelState
                               child: Text(
                                 instruction.text,
                                 style: TextStyle(
-                                  fontSize: 13,
+                                  fontSize: 11,
                                   fontWeight: isCurrentInstruction
                                       ? FontWeight.bold
                                       : (isSelected
@@ -220,38 +221,38 @@ class _NavigationInstructionsPanelState
                             if (isCurrentInstruction)
                               Container(
                                 padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 4,
+                                  horizontal: 6,
+                                  vertical: 2,
                                 ),
                                 decoration: BoxDecoration(
                                   color: Colors.orange[700],
-                                  borderRadius: BorderRadius.circular(12),
+                                  borderRadius: BorderRadius.circular(8),
                                 ),
                                 child: const Text(
                                   'TRENUTNO',
                                   style: TextStyle(
                                     color: Colors.white,
-                                    fontSize: 9,
+                                    fontSize: 8,
                                     fontWeight: FontWeight.bold,
                                   ),
                                 ),
                               ),
                           ],
                         ),
-                        const SizedBox(height: 2),
+                        const SizedBox(height: 1),
                         Row(
                           children: [
                             if (instruction.distance > 0) ...[
                               Icon(
                                 Icons.straighten,
-                                size: 12,
+                                size: 10,
                                 color: Colors.grey[600],
                               ),
-                              const SizedBox(width: 3),
+                              const SizedBox(width: 2),
                               Text(
                                 instruction.getDistanceText(),
                                 style: TextStyle(
-                                  fontSize: 11,
+                                  fontSize: 9,
                                   color: Colors.grey[600],
                                 ),
                               ),
@@ -260,14 +261,14 @@ class _NavigationInstructionsPanelState
                             if (instruction.time > 0) ...[
                               Icon(
                                 Icons.access_time,
-                                size: 12,
+                                size: 10,
                                 color: Colors.grey[600],
                               ),
-                              const SizedBox(width: 3),
+                              const SizedBox(width: 2),
                               Text(
                                 '${(instruction.time / 60000).round()} min',
                                 style: TextStyle(
-                                  fontSize: 11,
+                                  fontSize: 9,
                                   color: Colors.grey[600],
                                 ),
                               ),

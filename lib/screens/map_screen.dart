@@ -23,7 +23,6 @@ class _MapScreenState extends State<MapScreen> {
   MaplibreMapController? _mapController;
   Position? _currentPosition;
   LatLng? _snappedPosition; // 📍 SNAP-TO-ROAD: Pozicija "zakačena" na rutu
-  double _currentHeading = 0.0;
 
   List<LatLng> _routePoints = [];
   LatLng? _destination;
@@ -100,7 +99,6 @@ class _MapScreenState extends State<MapScreen> {
 
     setState(() {
       _currentPosition = position;
-      _currentHeading = position.heading;
       _isLoading = false;
     });
 
@@ -112,7 +110,6 @@ class _MapScreenState extends State<MapScreen> {
     _locationService.positionStream.listen((Position position) {
       setState(() {
         _currentPosition = position;
-        _currentHeading = position.heading;
 
         // 📍 SNAP-TO-ROAD: Ako imamo rutu, "zakači" poziciju na rutu
         if (_routePoints.isNotEmpty) {
@@ -1041,7 +1038,7 @@ class _MapScreenState extends State<MapScreen> {
                     ),
                   ),
 
-                // Panel sa informacijama o poziciji
+                // Panel sa brzinom i snap indikatorom
                 Positioned(
                   top: _currentRoutePath != null ? 160 : 16,
                   right: 16,
@@ -1062,18 +1059,15 @@ class _MapScreenState extends State<MapScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
                       children: [
+                        // Brzina u km/h
                         Text(
-                          '📍 ${_currentPosition?.latitude.toStringAsFixed(6) ?? "---"}',
-                          style: const TextStyle(fontSize: 12),
+                          '🚗 ${_currentPosition?.speed != null ? ((_currentPosition!.speed * 3.6).toStringAsFixed(0)) : "0"} km/h',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
-                        Text(
-                          '📍 ${_currentPosition?.longitude.toStringAsFixed(6) ?? "---"}',
-                          style: const TextStyle(fontSize: 12),
-                        ),
-                        Text(
-                          '🧭 ${_currentHeading.toStringAsFixed(1)}°',
-                          style: const TextStyle(fontSize: 12),
-                        ),
+                        const SizedBox(height: 4),
                         // 📍 SNAP-TO-ROAD indikator
                         if (_snappedPosition != null)
                           const Text(
