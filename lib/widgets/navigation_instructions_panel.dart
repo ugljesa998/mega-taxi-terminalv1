@@ -122,7 +122,8 @@ class _NavigationInstructionsPanelState
   Widget _buildInstructionsList() {
     return Container(
       constraints: BoxConstraints(
-        maxHeight: MediaQuery.of(context).size.height * 0.18,
+        maxHeight:
+            MediaQuery.of(context).size.height * 0.15, // Smanjeno sa 0.18
       ),
       child: ListView.builder(
         shrinkWrap: true,

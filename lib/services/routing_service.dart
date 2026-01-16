@@ -31,9 +31,23 @@ class RoutingService {
           );
 
       if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        print('✅ GraphHopper response primljen');
-        return GraphHopperResponse.fromJson(data);
+        // 📊 LOG RAW JSON RESPONSE (podeljen na delove zbog Flutter print limita)
+        print('━━━━━━━━━━━━━━ GRAPHHOPPER RAW JSON START ━━━━━━━━━━━━━━');
+
+        final responseBody = response.body;
+        const chunkSize = 800; // Flutter print limit je ~1000 karaktera
+
+        for (int i = 0; i < responseBody.length; i += chunkSize) {
+          final end = (i + chunkSize < responseBody.length)
+              ? i + chunkSize
+              : responseBody.length;
+          print(responseBody.substring(i, end));
+        }
+
+        print('━━━━━━━━━━━━━━━━━━ GRAPHHOPPER RAW JSON END ━━━━━━━━━━━━━━━━━━');
+
+        final jsonObject = json.decode(responseBody);
+        return GraphHopperResponse.fromJson(jsonObject);
       } else {
         print('❌ GraphHopper greška: ${response.statusCode}');
         return null;

@@ -78,6 +78,8 @@ class Instruction {
   final String streetName;
   final List<int> interval;
   final int? exitNumber;
+  final double?
+  heading; // 🧭 Heading za rotaciju kamere (kod sign=0 instrukcija)
 
   Instruction({
     required this.distance,
@@ -87,6 +89,7 @@ class Instruction {
     required this.streetName,
     required this.interval,
     this.exitNumber,
+    this.heading, // Opciono - samo sign=0 instrukcije imaju heading
   });
 
   factory Instruction.fromJson(Map<String, dynamic> json) {
@@ -98,6 +101,9 @@ class Instruction {
       streetName: json['street_name'] as String? ?? '',
       interval: (json['interval'] as List).map((e) => e as int).toList(),
       exitNumber: json['exit_number'] as int?,
+      heading: json['heading'] != null
+          ? (json['heading'] as num).toDouble()
+          : null,
     );
   }
 

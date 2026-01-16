@@ -1,5 +1,6 @@
-import 'dart:math';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // Za rootBundle (učitavanje assets)
 import 'package:maplibre_gl/maplibre_gl.dart';
 import 'package:geolocator/geolocator.dart';
 import '../services/location_service.dart';
@@ -29,22 +30,28 @@ class _MapScreenState extends State<MapScreen> {
   bool _isLoadingRoute = false;
   bool _isRerouting = false;
   bool _isLoading = true;
-  bool _is3DMode = false; // Podrazumevano 2D
+  bool _is3DMode = true; // 🎮 Podrazumevano 3D (kao u Android navigation)
   bool _isAutoFollowing = true;
   int _currentMapStyleIndex = 0;
 
   Line? _routeLine;
+  Line?
+  _routeShieldLine; // 📍 Shield layer (obrub oko rute) - kao u Android verziji
   Symbol? _destinationSymbol;
   Circle?
   _userLocationCircle; // 📍 SNAP-TO-ROAD: Custom location marker (kao LocationComponent)
   Circle? _userLocationPulse; // 📍 Pulsing circle oko markera za vidljivost
   Path? _currentRoutePath;
-  int _currentInstructionIndex =
-      1; // Počinjemo od 1 (preskačemo prvu instrukciju)
-  double _instructionThresholdDistance =
-      80.0; // Metara pre instrukcije za prikaz
 
-  static const double _navigationZoomLevel = 17.0;
+  // 🎯 DVA ODVOJENA SISTEMA:
+  // 1. Za KAMERU - prati SVE instrukcije (uključujući sign=0)
+  int _currentInstructionIndex = 1; // Za heading i rotaciju kamere
+
+  // 2. Za UI PRIKAZ - samo prave akcije (bez sign=0 "Continue")
+  List<Instruction> _filteredInstructions = [];
+  int _currentFilteredIndex = 0; // Index u filtriranoj listi za UI
+
+  static const double _navigationZoomLevel = 18.0; // 🔍 Bliži zoom nivo
   static const double _tiltAngle = 60.0;
   static const double _rerouteDistanceThreshold = 30.0;
 
@@ -142,7 +149,7 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   /// 📍 SNAP-TO-ROAD: Ažurira custom location marker (kao locationComponent.forceLocationUpdate)
-  /// Identično Android LocationComponent sa RenderMode.GPS
+  /// Identično Android LocationComponent sa RenderMode.GPS + Bearing Indicator
   Future<void> _updateUserLocationMarker() async {
     if (_mapController == null || _currentPosition == null) return;
 
@@ -160,31 +167,32 @@ class _MapScreenState extends State<MapScreen> {
         await _mapController!.removeCircle(_userLocationPulse!);
       }
 
-      // 1. Svetlo plavi/sivi accuracy circle (kao u Android verziji)
+      // 1. Accuracy circle (PLAVI - kao u Android verziji: maplibre_location_layer_blue)
       _userLocationPulse = await _mapController!.addCircle(
         CircleOptions(
           geometry: markerPosition,
-          circleRadius: 15.0, // Accuracy radius
-          circleColor: '#78909C', // Siva boja
-          circleOpacity: 0.15,
-          circleStrokeWidth: 1.5,
-          circleStrokeColor: '#78909C',
-          circleStrokeOpacity: 0.4,
+          circleRadius: 18.0, // Accuracy radius
+          circleColor:
+              '#56A8FB', // Plava boja iz Android navigation (route layer blue)
+          circleOpacity: 0.15, // Ista alpha kao u Android styles.xml
+          circleStrokeWidth: 0.0,
         ),
       );
 
-      // 2. MALI SIVI PIN u centru (kao GPS tačkica u Android LocationComponent)
+      // 2. PLAVI Location Marker u centru (kao Android maplibre_user_icon)
       _userLocationCircle = await _mapController!.addCircle(
         CircleOptions(
           geometry: markerPosition,
-          circleRadius: 5.0, // Mali radius - tačkica
-          circleColor: '#78909C', // Siva boja (kao u Android verziji)
+          circleRadius: 8.0, // Veći radius za bolju vidljivost
+          circleColor: '#56A8FB', // Plava navigation boja
           circleOpacity: 1.0,
-          circleStrokeWidth: 2.5,
+          circleStrokeWidth: 3.0,
           circleStrokeColor: '#FFFFFF', // Beli border
           circleStrokeOpacity: 1.0,
         ),
       );
+
+      // 📍 Bearing indicator uklonjen - nije potreban, dovoljno je samo plavi pin
     } catch (e) {
       // Ignoriši greške pri ažuriranju markera
     }
@@ -198,10 +206,13 @@ class _MapScreenState extends State<MapScreen> {
         _snappedPosition ??
         LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
 
-    // Ako imamo rutu, rotiramo kameru u pravcu sledeće tačke instrukcije
+    // 🧭 ROTACIJA KAMERE - kamera gleda OD tvoje pozicije KA SLEDEĆOJ tački na ruti
+    // Kao da stoji IZA tebe i gleda NAPRED prema sledecem delu puta
     double cameraBearing = 0.0;
-    if (_routePoints.isNotEmpty && _currentRoutePath != null) {
-      cameraBearing = _calculateBearingToNextInstruction();
+
+    if (_routePoints.isNotEmpty) {
+      // Nađi sledeću tačku na ruti ISPRED trenutne pozicije
+      cameraBearing = _calculateBearingToNextRoutePoint();
     }
 
     await _mapController!.animateCamera(
@@ -209,57 +220,92 @@ class _MapScreenState extends State<MapScreen> {
         CameraPosition(
           target: targetPosition,
           zoom: _navigationZoomLevel,
-          bearing: cameraBearing, // Rotacija ka sledećoj instrukciji
+          bearing:
+              cameraBearing, // 🧭 Rotira prema heading-u trenutne instrukcije
           tilt: _is3DMode ? _tiltAngle : 0.0,
         ),
       ),
     );
   }
 
-  /// Izračunava bearing (ugao) od trenutne pozicije ka sledećoj tački instrukcije
-  double _calculateBearingToNextInstruction() {
+  /// 🧭 Izračunava bearing OD trenutne pozicije KA sledećoj tački na ruti
+  /// Kamera "stoji iza tebe" i gleda napred prema putu
+  double _calculateBearingToNextRoutePoint() {
     if (_currentPosition == null || _routePoints.isEmpty) return 0.0;
-    if (_currentRoutePath == null) return 0.0;
 
-    final instructions = _currentRoutePath!.instructions;
-    if (_currentInstructionIndex >= instructions.length) return 0.0;
-
-    final currentInstruction = instructions[_currentInstructionIndex];
-    final instructionPointIndex = currentInstruction.interval.first;
-
-    if (instructionPointIndex >= _routePoints.length) return 0.0;
-
-    final targetPoint = _routePoints[instructionPointIndex];
-
-    // 📍 SNAP-TO-ROAD: Koristi snapped poziciju za bearing ako postoji
-    final fromPosition =
+    final currentPos =
         _snappedPosition ??
         LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
 
-    // Izračunavamo bearing od trenutne (snapped) pozicije ka tački instrukcije
+    // Nađi najbližu tačku na ruti ISPRED trenutne pozicije
+    LatLng? nextPoint;
+    double minDistance = double.infinity;
+    int closestIndex = 0;
+
+    // Prvo nađi najbližu tačku
+    for (int i = 0; i < _routePoints.length; i++) {
+      final distance = _routingService.calculateDistance(
+        currentPos.latitude,
+        currentPos.longitude,
+        _routePoints[i].latitude,
+        _routePoints[i].longitude,
+      );
+
+      if (distance < minDistance) {
+        minDistance = distance;
+        closestIndex = i;
+      }
+    }
+
+    // 🎯 Nađi tačku ~30 metara ISPRED za smooth kameru rotaciju
+    // Ovo daje stabilnu rotaciju kao u Google Maps
+    double accumulatedDistance = 0.0;
+    int lookAheadIndex = closestIndex;
+
+    for (int i = closestIndex; i < _routePoints.length - 1; i++) {
+      final segmentDistance = _routingService.calculateDistance(
+        _routePoints[i].latitude,
+        _routePoints[i].longitude,
+        _routePoints[i + 1].latitude,
+        _routePoints[i + 1].longitude,
+      );
+
+      accumulatedDistance += segmentDistance;
+      lookAheadIndex = i + 1;
+
+      // Pronađi tačku ~30m ispred
+      if (accumulatedDistance >= 30.0) break;
+    }
+
+    nextPoint = _routePoints[lookAheadIndex];
+
+    // Izračunaj bearing OD trenutne pozicije KA toj tački
     return _calculateBearing(
-      fromPosition.latitude,
-      fromPosition.longitude,
-      targetPoint.latitude,
-      targetPoint.longitude,
+      currentPos.latitude,
+      currentPos.longitude,
+      nextPoint.latitude,
+      nextPoint.longitude,
     );
   }
 
-  /// Izračunava bearing (ugao) između dve tačke
+  /// Pomoćna funkcija za računanje bearing-a između dve tačke (koristi dart:math)
   double _calculateBearing(double lat1, double lon1, double lat2, double lon2) {
-    final dLon = _toRadians(lon2 - lon1);
-    final lat1Rad = _toRadians(lat1);
-    final lat2Rad = _toRadians(lat2);
+    // Konvertuj u radijane
+    final lat1Rad = lat1 * math.pi / 180.0;
+    final lat2Rad = lat2 * math.pi / 180.0;
+    final dLon = (lon2 - lon1) * math.pi / 180.0;
 
-    final y = sin(dLon) * cos(lat2Rad);
+    // Haversine formula za bearing
+    final y = math.sin(dLon) * math.cos(lat2Rad);
     final x =
-        cos(lat1Rad) * sin(lat2Rad) - sin(lat1Rad) * cos(lat2Rad) * cos(dLon);
+        math.cos(lat1Rad) * math.sin(lat2Rad) -
+        math.sin(lat1Rad) * math.cos(lat2Rad) * math.cos(dLon);
 
-    final bearing = atan2(y, x);
-    return (bearing * 180 / pi + 360) % 360; // Konvertuje u stepene (0-360)
+    final bearing = math.atan2(y, x);
+
+    // Konvertuj u stepene (0-360)
+    return (bearing * 180.0 / math.pi + 360) % 360;
   }
-
-  double _toRadians(double degrees) => degrees * pi / 180.0;
 
   /// 📍 SNAP-TO-ROAD: Projektuje GPS poziciju na najbliži segment rute
   /// Algoritam identičan Android MapLibre Navigation SDK-u
@@ -353,6 +399,7 @@ class _MapScreenState extends State<MapScreen> {
         content: Text(_is3DMode ? '🎮 3D Pogled' : '📱 2D Mapa'),
         duration: const Duration(seconds: 1),
         backgroundColor: _is3DMode ? Colors.blue : Colors.grey,
+        behavior: SnackBarBehavior.fixed,
       ),
     );
   }
@@ -407,8 +454,20 @@ class _MapScreenState extends State<MapScreen> {
       if (_mapController != null) {
         await _mapController!.setStyle(_mapStyles[selectedIndex]['url']!);
 
-        // Sačekaj malo da se stil učita, pa ponovo nacrtaj rutu
+        // Resetuj reference na markere jer setStyle() briše sve
+        _userLocationCircle = null;
+        _userLocationPulse = null;
+        _routeLine = null;
+        _routeShieldLine = null;
+        _destinationSymbol = null;
+
+        // Sačekaj malo da se stil učita
         await Future.delayed(const Duration(milliseconds: 500));
+
+        // 📍 PRIORITET: Prvo nacrtaj location marker (da se ne izgubi!)
+        await _updateUserLocationMarker();
+
+        // Zatim nacrtaj rutu ako postoji
         if (_routePoints.isNotEmpty) {
           await _drawRoute();
           if (_destination != null) {
@@ -442,6 +501,17 @@ class _MapScreenState extends State<MapScreen> {
         final routePoints = _routingService.getRoutePoints(response);
 
         if (routePoints.isNotEmpty) {
+          // 🎯 FILTRIRAJ instrukcije - ukloni sve "Continue" (sign=0)
+          final allInstructions = response.paths.first.instructions;
+          final filtered = <Instruction>[];
+
+          for (var instr in allInstructions) {
+            // Preskoči "Continue" instrukcije (sign = 0)
+            if (instr.sign != 0) {
+              filtered.add(instr);
+            }
+          }
+
           setState(() {
             _currentRoutePath = response.paths.first;
             _routePoints = routePoints;
@@ -449,6 +519,10 @@ class _MapScreenState extends State<MapScreen> {
             _isLoadingRoute = false;
             _currentInstructionIndex =
                 1; // Počinjemo od druge instrukcije (index 1)
+
+            // 🎯 Setuj filtriranu listu i startuj od prve PRAVE akcije
+            _filteredInstructions = filtered;
+            _currentFilteredIndex = 0;
 
             // 📍 SNAP-TO-ROAD: Odmah snap-uj trenutnu poziciju na novu rutu
             if (_currentPosition != null) {
@@ -493,16 +567,35 @@ class _MapScreenState extends State<MapScreen> {
   Future<void> _drawRoute() async {
     if (_mapController == null || _routePoints.isEmpty) return;
 
+    // Obriši stare linije
     if (_routeLine != null) {
       await _mapController!.removeLine(_routeLine!);
     }
+    if (_routeShieldLine != null) {
+      await _mapController!.removeLine(_routeShieldLine!);
+    }
 
+    // 1. Shield Layer (obrub oko rute) - tamnija i deblja linija ispod glavne
+    // Identično Android MapRouteLayerProvider shield layer
+    _routeShieldLine = await _mapController!.addLine(
+      LineOptions(
+        geometry: _routePoints,
+        lineColor: '#2F7AC6', // Shield color iz Android navigation
+        lineWidth: 10.0, // Deblja od glavne linije
+        lineOpacity: 0.7,
+        lineJoin: 'round',
+      ),
+    );
+
+    // 2. Glavna Route Layer (svetlo plava)
+    // Boja i stil iz Android NavigationMapRoute
     _routeLine = await _mapController!.addLine(
       LineOptions(
         geometry: _routePoints,
-        lineColor: '#4A90E2',
-        lineWidth: 6.0,
-        lineOpacity: 0.9,
+        lineColor: '#56A8FB', // Route layer blue iz Android navigation
+        lineWidth: 7.0, // Optimalna debljina za navigation
+        lineOpacity: 0.95,
+        lineJoin: 'round', // Rounded line join kao u Android
       ),
     );
   }
@@ -514,14 +607,36 @@ class _MapScreenState extends State<MapScreen> {
       await _mapController!.removeSymbol(_destinationSymbol!);
     }
 
-    _destinationSymbol = await _mapController!.addSymbol(
-      SymbolOptions(
-        geometry: _destination!,
-        iconImage: 'marker-15',
-        iconSize: 2.5,
-        iconColor: '#FF0000',
-      ),
-    );
+    // 📍 Koristimo map_marker_dark.png iz Android navigation UI
+    // (navigationViewDestinationMarker iz styles.xml)
+    try {
+      // Pokušaj da dodaš custom marker sliku
+      await _mapController!.addImage(
+        'destination-marker',
+        (await rootBundle.load(
+          'assets/icons/map_marker_dark.png',
+        )).buffer.asUint8List(),
+      );
+
+      _destinationSymbol = await _mapController!.addSymbol(
+        SymbolOptions(
+          geometry: _destination!,
+          iconImage: 'destination-marker',
+          iconSize: 1.5, // Odgovarajuća veličina
+          iconAnchor: 'bottom', // Sidri marker na dnu (pin stil)
+        ),
+      );
+    } catch (e) {
+      // Fallback na standardni marker ako slika ne uspe
+      _destinationSymbol = await _mapController!.addSymbol(
+        SymbolOptions(
+          geometry: _destination!,
+          iconImage: 'marker-15',
+          iconSize: 2.5,
+          iconColor: '#E93340', // Crvena iz Android navigation (congestion red)
+        ),
+      );
+    }
   }
 
   Future<void> _fitRouteBounds() async {
@@ -557,6 +672,9 @@ class _MapScreenState extends State<MapScreen> {
     if (_routeLine != null && _mapController != null) {
       await _mapController!.removeLine(_routeLine!);
     }
+    if (_routeShieldLine != null && _mapController != null) {
+      await _mapController!.removeLine(_routeShieldLine!);
+    }
     if (_destinationSymbol != null && _mapController != null) {
       await _mapController!.removeSymbol(_destinationSymbol!);
     }
@@ -565,9 +683,12 @@ class _MapScreenState extends State<MapScreen> {
       _routePoints = [];
       _destination = null;
       _routeLine = null;
+      _routeShieldLine = null;
       _destinationSymbol = null;
       _currentRoutePath = null;
       _currentInstructionIndex = 1;
+      _filteredInstructions = []; // 🎯 Reset filtrirane instrukcije
+      _currentFilteredIndex = 0;
       _snappedPosition = null; // 📍 SNAP-TO-ROAD: Reset snapped pozicije
     });
 
@@ -577,20 +698,19 @@ class _MapScreenState extends State<MapScreen> {
     _showSuccess('Ruta obrisana');
   }
 
-  /// Proverava napredak prema sledećoj instrukciji
+  /// Proverava napredak prema sledećoj PRAOJ akciji (iz filtrirane liste)
   void _checkInstructionProgress() {
     if (_currentRoutePath == null || _currentPosition == null) return;
-    if (_routePoints.isEmpty) return;
+    if (_routePoints.isEmpty || _filteredInstructions.isEmpty) return;
 
-    final instructions = _currentRoutePath!.instructions;
+    // Preskačemo ako smo prošli sve filtrirane instrukcije
+    if (_currentFilteredIndex >= _filteredInstructions.length) return;
 
-    // Preskačemo ako smo prošli sve instrukcije
-    if (_currentInstructionIndex >= instructions.length) return;
+    final currentFilteredInstruction =
+        _filteredInstructions[_currentFilteredIndex];
 
-    final currentInstruction = instructions[_currentInstructionIndex];
-
-    // Dobijamo tačku na ruti gde se nalazi trenutna instrukcija
-    final instructionPointIndex = currentInstruction.interval.first;
+    // Dobijamo tačku na ruti gde se nalazi ova instrukcija
+    final instructionPointIndex = currentFilteredInstruction.interval.first;
 
     if (instructionPointIndex < _routePoints.length) {
       final instructionPoint = _routePoints[instructionPointIndex];
@@ -607,35 +727,55 @@ class _MapScreenState extends State<MapScreen> {
         instructionPoint.longitude,
       );
 
-      // Ako smo prošli instrukciju (manje od 20m), prelazimo na sledeću
-      if (distanceToInstruction < 20.0) {
+      // Ako smo prošli instrukciju (manje od 15m), prelazimo na sledeću PRAVU akciju
+      if (distanceToInstruction < 15.0) {
         setState(() {
-          _currentInstructionIndex++;
+          _currentFilteredIndex++;
         });
 
-        // Prikaži sledeću instrukciju
-        if (_currentInstructionIndex < instructions.length) {
+        // Prikaži sledeću PRAVU akciju
+        if (_currentFilteredIndex < _filteredInstructions.length) {
           _showCurrentInstruction();
         } else {
           _showSuccess('🏁 Stigli ste na destinaciju!');
         }
       }
-      // Ako se približavamo (unutar threshold-a), možemo dodati audio upozorenje
-      else if (distanceToInstruction < _instructionThresholdDistance &&
-          distanceToInstruction > 20.0) {
-        // Ovde možemo dodati audio ili vizuelno upozorenje
-      }
     }
   }
 
-  /// Prikazuje trenutnu aktivnu instrukciju
+  /// Prikazuje sledeću PRAVU akciju (iz filtrirane liste)
   void _showCurrentInstruction() {
-    if (_currentRoutePath == null) return;
+    // 🎯 Koristi filtriranu listu - prikazuj samo prave akcije
+    if (_filteredInstructions.isEmpty) return;
+    if (_currentFilteredIndex >= _filteredInstructions.length) {
+      // Stigli smo do kraja - prikaži "Arrive"
+      return;
+    }
 
-    final instructions = _currentRoutePath!.instructions;
-    if (_currentInstructionIndex >= instructions.length) return;
+    final instruction = _filteredInstructions[_currentFilteredIndex];
 
-    final instruction = instructions[_currentInstructionIndex];
+    // Izračunaj preostalu distancu do ove instrukcije u realnom vremenu
+    double remainingDistance = instruction.distance;
+
+    if (_currentPosition != null && _routePoints.isNotEmpty) {
+      // Pronađi tačku u ruti gde počinje ova instrukcija
+      final instructionPointIndex = instruction.interval.first;
+
+      if (instructionPointIndex < _routePoints.length) {
+        final instructionPoint = _routePoints[instructionPointIndex];
+
+        final fromPosition =
+            _snappedPosition ??
+            LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
+
+        remainingDistance = _routingService.calculateDistance(
+          fromPosition.latitude,
+          fromPosition.longitude,
+          instructionPoint.latitude,
+          instructionPoint.longitude,
+        );
+      }
+    }
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -658,11 +798,10 @@ class _MapScreenState extends State<MapScreen> {
                       fontSize: 15,
                     ),
                   ),
-                  if (instruction.distance > 0)
-                    Text(
-                      'Za ${instruction.getDistanceText()}',
-                      style: const TextStyle(fontSize: 13),
-                    ),
+                  Text(
+                    'Za ${remainingDistance.round()} m',
+                    style: const TextStyle(fontSize: 13),
+                  ),
                 ],
               ),
             ),
@@ -670,8 +809,7 @@ class _MapScreenState extends State<MapScreen> {
         ),
         duration: const Duration(seconds: 4),
         backgroundColor: Colors.blue[800],
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        behavior: SnackBarBehavior.fixed,
       ),
     );
   }
@@ -732,12 +870,26 @@ class _MapScreenState extends State<MapScreen> {
         final routePoints = _routingService.getRoutePoints(response);
 
         if (routePoints.isNotEmpty) {
+          // 🎯 FILTRIRAJ instrukcije za re-routing
+          final allInstructions = response.paths.first.instructions;
+          final filtered = <Instruction>[];
+
+          for (var instr in allInstructions) {
+            if (instr.sign != 0) {
+              filtered.add(instr);
+            }
+          }
+
           setState(() {
             _currentRoutePath = response.paths.first;
             _routePoints = routePoints;
             _isRerouting = false;
             _currentInstructionIndex =
                 1; // Reset na drugu instrukciju posle reroutinga
+
+            // 🎯 Reset filtrirane instrukcije
+            _filteredInstructions = filtered;
+            _currentFilteredIndex = 0;
 
             // 📍 SNAP-TO-ROAD: Snap-uj na novu re-route-ovanu rutu
             if (_currentPosition != null) {
@@ -757,6 +909,7 @@ class _MapScreenState extends State<MapScreen> {
               content: Text('🔄 Ruta ažurirana'),
               duration: Duration(seconds: 1),
               backgroundColor: Colors.orange,
+              behavior: SnackBarBehavior.fixed,
             ),
           );
 
@@ -776,13 +929,23 @@ class _MapScreenState extends State<MapScreen> {
   void _showError(String message) {
     setState(() => _isLoading = false);
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('❌ $message'), backgroundColor: Colors.red),
+      SnackBar(
+        content: Text('❌ $message'),
+        backgroundColor: Colors.red,
+        behavior: SnackBarBehavior.fixed, // Fixed na dnu, iznad panela
+        duration: const Duration(seconds: 3),
+      ),
     );
   }
 
   void _showSuccess(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('✅ $message'), backgroundColor: Colors.green),
+      SnackBar(
+        content: Text('✅ $message'),
+        backgroundColor: Colors.green,
+        behavior: SnackBarBehavior.fixed, // Fixed na dnu, iznad panela
+        duration: const Duration(seconds: 2),
+      ),
     );
   }
 
@@ -861,22 +1024,19 @@ class _MapScreenState extends State<MapScreen> {
                   minMaxZoomPreference: const MinMaxZoomPreference(5.0, 20.0),
                 ),
 
-                // Veliki banner sa trenutnom instrukcijom (na vrhu)
-                if (_currentRoutePath != null &&
-                    _currentInstructionIndex <
-                        _currentRoutePath!.instructions.length)
+                // Veliki banner sa trenutnom PRAVOM akcijom (na vrhu)
+                if (_filteredInstructions.isNotEmpty &&
+                    _currentFilteredIndex < _filteredInstructions.length)
                   Positioned(
                     top: 16,
                     left: 16,
                     right: 16,
                     child: CurrentInstructionBanner(
-                      instruction: _currentRoutePath!
-                          .instructions[_currentInstructionIndex],
+                      instruction: _filteredInstructions[_currentFilteredIndex],
                       nextInstruction:
-                          _currentInstructionIndex + 1 <
-                              _currentRoutePath!.instructions.length
-                          ? _currentRoutePath!
-                                .instructions[_currentInstructionIndex + 1]
+                          _currentFilteredIndex + 1 <
+                              _filteredInstructions.length
+                          ? _filteredInstructions[_currentFilteredIndex + 1]
                           : null,
                     ),
                   ),
