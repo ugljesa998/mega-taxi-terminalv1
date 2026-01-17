@@ -30,7 +30,7 @@ class _MapScreenState extends State<MapScreen> {
   bool _isRerouting = false;
   bool _isLoading = true;
   bool _is3DMode = true; // 🎮 Podrazumevano 3D (kao u Android navigation)
-  bool _isAutoFollowing = true;
+  bool _isAutoFollowing = false; // 🎯 Isključen auto-follow - samo na klik
   int _currentMapStyleIndex = 0;
 
   Line? _routeLine;
@@ -536,10 +536,11 @@ class _MapScreenState extends State<MapScreen> {
           // 📍 SNAP-TO-ROAD: Ažuriraj marker odmah nakon što se kreira ruta
           await _updateUserLocationMarker();
 
-          Future.delayed(const Duration(seconds: 2), () {
-            _centerMapOnUser();
-            setState(() => _isAutoFollowing = true);
-          });
+          // 🎯 NE aktiviraj auto-follow automatski - korisnik mora kliknuti dugme
+          // Future.delayed(const Duration(seconds: 2), () {
+          //   _centerMapOnUser();
+          //   setState(() => _isAutoFollowing = true);
+          // });
 
           _showSuccess(
             'Ruta: ${_currentRoutePath!.getDistanceText()} • ${_currentRoutePath!.getTimeText()}',
