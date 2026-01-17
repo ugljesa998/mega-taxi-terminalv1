@@ -31,6 +31,8 @@ class _MapScreenState extends State<MapScreen> {
   bool _isLoading = true;
   bool _is3DMode = true; // 🎮 Podrazumevano 3D (kao u Android navigation)
   bool _isAutoFollowing = false; // 🎯 Isključen auto-follow - samo na klik
+  bool _isProgrammaticCameraMove =
+      false; // 🎯 Flag za razlikovanje user vs programmatic camera moves
   int _currentMapStyleIndex = 0;
 
   Line? _routeLine;
@@ -204,13 +206,16 @@ class _MapScreenState extends State<MapScreen> {
         LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
 
     // 🧭 ROTACIJA KAMERE - kamera gleda OD tvoje pozicije KA SLEDEĆOJ tački na ruti
-    // Kao da stoji IZA tebe i gleda NAPRED prema sledecem delu puta
+    // Kao da stoji IZA tebe i gleda NAPRED prema sledecom delu puta
     double cameraBearing = 0.0;
 
     if (_routePoints.isNotEmpty) {
       // Nađi sledeću tačku na ruti ISPRED trenutne pozicije
       cameraBearing = _calculateBearingToNextRoutePoint();
     }
+
+    // 🎯 Označi da je ovo programmatic move
+    _isProgrammaticCameraMove = true;
 
     await _mapController!.animateCamera(
       CameraUpdate.newCameraPosition(
@@ -388,7 +393,10 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _toggle3DMode() {
-    setState(() => _is3DMode = !_is3DMode);
+    setState(() {
+      _is3DMode = !_is3DMode;
+      _isAutoFollowing = false; // 🎯 Isključi autofokus kad se menja prikaz
+    });
     _centerMapOnUser();
 
     ScaffoldMessenger.of(context).showSnackBar(
@@ -536,11 +544,11 @@ class _MapScreenState extends State<MapScreen> {
           // 📍 SNAP-TO-ROAD: Ažuriraj marker odmah nakon što se kreira ruta
           await _updateUserLocationMarker();
 
-          // 🎯 NE aktiviraj auto-follow automatski - korisnik mora kliknuti dugme
-          // Future.delayed(const Duration(seconds: 2), () {
-          //   _centerMapOnUser();
-          //   setState(() => _isAutoFollowing = true);
-          // });
+          // 🎯 Pozicioniraj kameru JEDNOM kada ruta krene, ali ne aktiviraj auto-follow
+          Future.delayed(const Duration(seconds: 2), () {
+            _centerMapOnUser(); // Samo centraj jednom
+            // _isAutoFollowing ostaje false - korisnik može slobodno da se kreće
+          });
 
           _showSuccess(
             'Ruta: ${_currentRoutePath!.getDistanceText()} • ${_currentRoutePath!.getTimeText()}',
@@ -651,6 +659,9 @@ class _MapScreenState extends State<MapScreen> {
       if (point.longitude < minLng) minLng = point.longitude;
       if (point.longitude > maxLng) maxLng = point.longitude;
     }
+
+    // 🎯 Označi da je ovo programmatic move
+    _isProgrammaticCameraMove = true;
 
     await _mapController!.animateCamera(
       CameraUpdate.newLatLngBounds(
@@ -1014,6 +1025,18 @@ class _MapScreenState extends State<MapScreen> {
                     } else {
                       // Ako nema rute, odmah kreiraj
                       _createRouteToDestination(latLng);
+                    }
+                  },
+                  onCameraIdle: () {
+                    // 🎯 Isključi auto-follow samo ako je korisnik ručno pomerio mapu
+                    if (_isProgrammaticCameraMove) {
+                      // Ovo je bio programmatic move, samo resetuj flag
+                      _isProgrammaticCameraMove = false;
+                    } else {
+                      // Ovo je bio user-initiated move, isključi auto-follow
+                      if (_isAutoFollowing) {
+                        setState(() => _isAutoFollowing = false);
+                      }
                     }
                   },
                   // 📍 SNAP-TO-ROAD: Isključena built-in strelica, koristimo samo custom marker
